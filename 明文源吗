@@ -1,5 +1,8 @@
-    import { connect } from 'cloudflare:sockets';
+import { connect } from 'cloudflare:sockets';
 
+    // ==========================================
+    // 1. 全局配置与缓存优化
+    // ==========================================
     let at = '351c9981-04b6-4103-aa4b-864aa9c91469';
     let fallbackAddress = '';
     let socks5Config = '';
@@ -25,11 +28,18 @@
     const remoteConfigUrl = 'https://raw.githubusercontent.com/byJoey/test/refs/heads/main/tist.ini';
 
     let epd = false;   // 优选域名默认关闭
-    let epi = true;       
-    let egi = true;          
+    let epi = true;        
+    let egi = true;           
 
+    // KV优化配置
     let kvStore = null;
     let kvConfig = {};
+    let cachedConfig = null; // 内存缓存
+    let lastCacheTime = 0;   // 最后缓存时间
+    const MEMORY_CACHE_TTL = 300000; // 内存缓存5分钟
+    const MAX_KV_SIZE = 10240; // KV最大大小限制(10KB)
+    const MAX_YX_LENGTH = 1000; // 优选IP列表最大长度
+    const MAX_PREFERRED_IPS = 100; // 最多保存100个优选IP
 
     const regionMapping = {
         'US': ['🇺🇸 美国', 'US', 'United States'],
@@ -112,7 +122,6 @@
     }
 
     async function initKVStore(env) {
-        
         if (env.C) {
             try {
                 kvStore = env.C;
@@ -120,25 +129,35 @@
             } catch (error) {
                 kvStore = null;
             }
-        } else {
         }
     }
 
     async function loadKVConfig() {
-        
         if (!kvStore) {
             return;
         }
         
+        // 检查内存缓存是否有效，减少KV读取
+        const now = Date.now();
+        if (cachedConfig && (now - lastCacheTime < MEMORY_CACHE_TTL)) {
+            kvConfig = cachedConfig;
+            return;
+        }
+        
         try {
-            const configData = await kvStore.get('c');
+            // 使用CF边缓缓存，减少KV读取频率
+            const configData = await kvStore.get('c', { cacheTtl: 300 });
             
             if (configData) {
                 kvConfig = JSON.parse(configData);
-            } else {
+                // 更新内存缓存
+                cachedConfig = kvConfig;
+                lastCacheTime = now;
             }
         } catch (error) {
             kvConfig = {};
+            cachedConfig = {};
+            lastCacheTime = now;
         }
     }
 
@@ -148,10 +167,39 @@
         }
         
         try {
-            const configString = JSON.stringify(kvConfig);
-            await kvStore.put('c', configString);
+            // 优化1：创建优化后的配置副本
+            let optimizedConfig = { ...kvConfig };
+            
+            // 优化2：限制优选IP列表大小
+            if (optimizedConfig.yx && optimizedConfig.yx.length > MAX_YX_LENGTH) {
+                let truncatedYx = optimizedConfig.yx.substring(0, MAX_YX_LENGTH);
+                const lastComma = truncatedYx.lastIndexOf(',');
+                if (lastComma > 0) {
+                    truncatedYx = truncatedYx.substring(0, lastComma);
+                }
+                optimizedConfig.yx = truncatedYx;
+            }
+            
+            // 优化3：移除过大的临时配置项
+            delete optimizedConfig.tempData;
+            delete optimizedConfig.largeCache;
+            
+            // 优化4：限制KV总大小
+            const configString = JSON.stringify(optimizedConfig);
+            if (configString.length > MAX_KV_SIZE) {
+                console.warn('KV配置大小超过限制，本次不保存');
+                return;
+            }
+            
+            // 优化5：添加过期时间，避免永久存储
+            await kvStore.put('c', configString, { expirationTtl: 2592000 }); // 30天过期
+            
+            // 更新内存缓存
+            cachedConfig = optimizedConfig;
+            lastCacheTime = Date.now();
         } catch (error) {
-            throw error; 
+            console.error('KV保存失败:', error);
+            // 失败时不抛出错误，避免影响主流程
         }
     }
 
@@ -655,16 +703,31 @@
                         const customHomepage = getConfigValue('homepage', env.homepage || env.HOMEPAGE);
                         if (customHomepage && customHomepage.trim()) {
                             try {
-                                // 从自定义URL获取内容
-                                const homepageResponse = await fetch(customHomepage.trim(), {
-                                    method: 'GET',
-                                    headers: {
-                                        'User-Agent': request.headers.get('User-Agent') || 'Mozilla/5.0',
-                                        'Accept': request.headers.get('Accept') || '*/*',
-                                        'Accept-Language': request.headers.get('Accept-Language') || 'en-US,en;q=0.9',
-                                    },
-                                    redirect: 'follow'
+                                // 添加超时控制，避免长时间阻塞
+                                const timeoutPromise = new Promise((_, reject) => {
+                                    setTimeout(() => reject(new Error('Custom homepage fetch timeout')), 3000);
                                 });
+                                
+                                // 使用传统的AbortController方式实现超时
+                                const controller = new AbortController();
+                                const timeoutId = setTimeout(() => controller.abort(), 3000);
+                                
+                                // 从自定义URL获取内容
+                                const homepageResponse = await Promise.race([
+                                    fetch(customHomepage.trim(), {
+                                        method: 'GET',
+                                        headers: {
+                                            'User-Agent': request.headers.get('User-Agent') || 'Mozilla/5.0',
+                                            'Accept': request.headers.get('Accept') || '*/*',
+                                            'Accept-Language': request.headers.get('Accept-Language') || 'en-US,en;q=0.9',
+                                        },
+                                        redirect: 'follow',
+                                        signal: controller.signal
+                                    }),
+                                    timeoutPromise
+                                ]);
+                                
+                                clearTimeout(timeoutId);
                                 
                                 if (homepageResponse.ok) {
                                     // 获取响应内容
@@ -1194,6 +1257,26 @@
         return btoa(links.join('\n'));
     }
 
+    async function generateClashConfig(links) {
+        return btoa(links.join('\n'));
+    }
+
+    function generateSurgeConfig(links) {
+        return btoa(links.join('\n'));
+    }
+
+    function generateSSConfig(links) {
+        return btoa(links.join('\n'));
+    }
+
+    function generateV2RayConfig(links) {
+        return btoa(links.join('\n'));
+    }
+
+    function generateLoonConfig(links) {
+        return btoa(links.join('\n'));
+    }
+
     async function handleSubscriptionRequest(request, user, url = null) {
         if (!url) url = new URL(request.url);
         
@@ -1625,14 +1708,14 @@
                         if (!vlessResult.hasError) {
                             protocolType = 'vless';
                             const { addressType, port, hostname, rawIndex, version, isUDP } = vlessResult;
-                if (isUDP) {
-                    if (port === 53) isDnsQuery = true;
-                    else throw new Error(E_UDP_DNS_ONLY);
-                }
-                const respHeader = new Uint8Array([version[0], 0]);
-                const rawData = chunk.slice(rawIndex);
-                if (isDnsQuery) return forwardUDP(rawData, serverSock, respHeader);
-                await forwardTCP(addressType, hostname, port, rawData, serverSock, respHeader, remoteConnWrapper);
+                            if (isUDP) {
+                                if (port === 53) isDnsQuery = true;
+                                else throw new Error(E_UDP_DNS_ONLY);
+                            }
+                            const respHeader = new Uint8Array([version[0], 0]);
+                            const rawData = chunk.slice(rawIndex);
+                            if (isDnsQuery) return forwardUDP(rawData, serverSock, respHeader);
+                            await forwardTCP(addressType, hostname, port, rawData, serverSock, respHeader, remoteConnWrapper);
                             return;
                         }
                     }
@@ -1657,13 +1740,22 @@
 
     async function forwardTCP(addrType, host, portNum, rawData, ws, respHeader, remoteConnWrapper) {
         async function connectAndSend(address, port, useSocks = false) {
-            const remoteSock = useSocks ?
-                await establishSocksConnection(addrType, address, port) :
-                connect({ hostname: address, port: port });
-            const writer = remoteSock.writable.getWriter();
-            await writer.write(rawData);
-            writer.releaseLock();
-            return remoteSock;
+            // 添加5秒超时控制
+            const timeoutPromise = new Promise((_, reject) => {
+                setTimeout(() => reject(new Error('Connection timeout')), 5000);
+            });
+            
+            const connectionPromise = (async () => {
+                const remoteSock = useSocks ?
+                    await establishSocksConnection(addrType, address, port) :
+                    connect({ hostname: address, port: port });
+                const writer = remoteSock.writable.getWriter();
+                await writer.write(rawData);
+                writer.releaseLock();
+                return remoteSock;
+            })();
+            
+            return await Promise.race([connectionPromise, timeoutPromise]);
         }
         
         async function retryConnection() {
@@ -1799,18 +1891,32 @@
 
     async function establishSocksConnection(addrType, address, port) {
         const { username, password, hostname, socksPort } = parsedSocks5Config;
+        
+        // 添加5秒超时控制
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('SOCKS connection timeout')), 5000);
+        });
+        
+        // 执行连接操作
         const socket = connect({ hostname, port: socksPort });
         const writer = socket.writable.getWriter();
         await writer.write(new Uint8Array(username ? [5, 2, 0, 2] : [5, 1, 0]));
         const reader = socket.readable.getReader();
-        let res = (await reader.read()).value;
+        
+        // 读取超时封装
+        const readWithTimeout = async () => {
+            const readPromise = reader.read();
+            return await Promise.race([readPromise, timeoutPromise]);
+        };
+        
+        let res = (await readWithTimeout()).value;
         if (res[0] !== 5 || res[1] === 255) throw new Error(E_SOCKS_NO_METHOD);
         if (res[1] === 2) {
             if (!username || !password) throw new Error(E_SOCKS_AUTH_NEEDED);
             const encoder = new TextEncoder();
             const authRequest = new Uint8Array([1, username.length, ...encoder.encode(username), password.length, ...encoder.encode(password)]);
             await writer.write(authRequest);
-            res = (await reader.read()).value;
+            res = (await readWithTimeout()).value;
             if (res[0] !== 1 || res[1] !== 0) throw new Error(E_SOCKS_AUTH_FAIL);
         }
         const encoder = new TextEncoder(); let DSTADDR;
@@ -1821,7 +1927,7 @@
             default: throw new Error(E_INVALID_ADDR_TYPE);
         }
         await writer.write(new Uint8Array([5, 1, 0, ...DSTADDR, port >> 8, port & 255]));
-        res = (await reader.read()).value;
+        res = (await readWithTimeout()).value;
         if (res[1] !== 0) throw new Error(E_SOCKS_CONN_FAIL);
         writer.releaseLock(); reader.releaseLock();
         return socket;
@@ -5577,7 +5683,10 @@
                 customPreferredIPs = [];
                 customPreferredDomains = [];
                 
-                preferredList.forEach(item => {
+                // 优化：限制最多处理MAX_PREFERRED_IPS个IP
+                const limitedList = preferredList.slice(0, MAX_PREFERRED_IPS);
+                
+                limitedList.forEach(item => {
                     let nodeName = '';
                     let addressPart = item;
                     
@@ -5623,7 +5732,10 @@
         const items = yxValue.split(',').map(item => item.trim()).filter(item => item);
         const result = [];
         
-        for (const item of items) {
+        // 优化：限制最多处理MAX_PREFERRED_IPS个IP
+        const limitedItems = items.slice(0, MAX_PREFERRED_IPS);
+        
+        for (const item of limitedItems) {
             
             let nodeName = '';
             let addressPart = item;
@@ -5640,11 +5752,11 @@
                 nodeName = address + (port ? ':' + port : '');
             }
             
+            // 优化：移除不必要的addedAt属性，减少内存占用
             result.push({
                 ip: address,
                 port: port || 443,
-                name: nodeName,
-                addedAt: new Date().toISOString()
+                name: nodeName
             });
         }
         
